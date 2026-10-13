@@ -1,0 +1,52 @@
+name: Build data packs
+
+on:
+  schedule:
+    - cron: "30 22 * * *" # after Cardmarket/MTGJSON/tcgcsv daily refresh
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KEEP_DAILY: 7
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build catalog + prices
+        run: python -I pipeline/build.py --work work --out out
+
+      - name: Publish to "data" release (app reads from here)
+        run: |
+          if ! gh release view data >/dev/null 2>&1; then
+            gh release create data --title "Data packs" \
+              --notes "Stable download URL for the app: releases/download/data/manifest.json"
+          fi
+          gh release upload data out/manifest.json out/catalog_mtg.sqlite.gz out/prices_mtg.jsonl.gz --clobber
+
+      - name: Keep dated price snapshot
+        run: |
+          day=$(date -u +%F)
+          cp out/prices_mtg.jsonl.gz "out/prices_mtg_${day}.jsonl.gz"
+          gh release delete "prices-${day}" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "prices-${day}" "out/prices_mtg_${day}.jsonl.gz" \
+            --prerelease --title "Prices ${day}" --notes "Daily price snapshot."
+
+      - name: Prune old snapshots
+        run: |
+          gh release list --limit 200 --json tagName --jq '.[].tagName' \
+            | grep '^prices-' | sort -r | tail -n +$((KEEP_DAILY + 1)) \
+            | xargs -r -I{} gh release delete {} --yes --cleanup-tag

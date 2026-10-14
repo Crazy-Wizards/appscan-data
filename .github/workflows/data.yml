@@ -15,16 +15,27 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     env:
       GH_TOKEN: ${{ github.token }}
       KEEP_DAILY: 7
+      # New art hashes per run; the first full pass converges over a few days.
+      ART_MAX_NEW: 20000
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install art hashing deps
+        run: pip install pillow numpy resvg-py
+
+      - name: Restore scanner index caches
+        run: |
+          mkdir -p work
+          gh release download data -p art_hashes_mtg.json.gz -D work || echo "no art cache yet"
+          gh release download data -p set_icons_mtg.json.gz -D work || echo "no icon cache yet"
 
       - name: Build catalog + prices
         run: python -I pipeline/build.py --work work --out out
@@ -38,6 +49,9 @@ jobs:
           # Packs first, manifest last: clients must never see a manifest that
           # points at files not uploaded yet.
           gh release upload data out/catalog_mtg.sqlite.gz out/prices_mtg.jsonl.gz --clobber
+          for f in art_hashes_mtg.json.gz set_icons_mtg.json.gz; do
+            if [ -f "out/$f" ]; then gh release upload data "out/$f" --clobber; fi
+          done
           gh release upload data out/manifest.json --clobber
 
       - name: Keep dated price snapshot

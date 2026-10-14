@@ -5,12 +5,16 @@ Outputs (in --out):
   prices_mtg.jsonl.gz    today's prices per Scryfall id, per source and finish
   manifest.json          versions, hashes and sizes the app checks before downloading
 
-Standard library only, so the GitHub Action needs no pip install.
+Standard library only, except the optional scanner indexes: art hashes
+(pipeline/art.py, Pillow + numpy) and set symbol masks (pipeline/icons.py,
+also resvg-py). Without them the catalog ships without the `art` /
+`set_icons` tables.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import csv
 import datetime as dt
 import gzip
@@ -24,7 +28,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-USER_AGENT = "AppScanData/0.1 (+https://github.com/pumpedkk/appscan-data)"
+USER_AGENT = "AppScanData/0.1 (+https://github.com/Crazy-Wizards/appscan-data)"
 SCRYFALL_IMG = "https://cards.scryfall.io/normal/"
 
 SCRYFALL_BULK = "https://api.scryfall.com/bulk-data/default-cards"
@@ -132,6 +136,10 @@ CREATE TABLE cards (
 CREATE INDEX cards_set_num ON cards(set_code, collector_number);
 CREATE INDEX cards_oracle ON cards(oracle_id);
 CREATE INDEX cards_name ON cards(name COLLATE NOCASE);
+-- 64-bit pHash of each printing's art (see pipeline/art.py), for the scanner.
+CREATE TABLE art (card_id TEXT PRIMARY KEY, phash INTEGER NOT NULL) WITHOUT ROWID;
+-- 32x32 set symbol silhouette, 128 bytes (see pipeline/icons.py).
+CREATE TABLE set_icons (code TEXT PRIMARY KEY, mask BLOB NOT NULL) WITHOUT ROWID;
 CREATE VIRTUAL TABLE cards_fts USING fts5(
   name, printed_name, content='cards', content_rowid='rowid',
   tokenize='unicode61 remove_diacritics 2'
@@ -181,6 +189,55 @@ def card_row(c: dict) -> tuple | None:
     )
 
 
+def art_source(c: dict) -> tuple[str, str] | None:
+    """(illustration id, art_crop URL) of a printing's front face."""
+    faces = c.get("card_faces") or []
+    iid = c.get("illustration_id") or (faces[0].get("illustration_id") if faces else None)
+    uris = c.get("image_uris") or (faces[0].get("image_uris") if faces else None) or {}
+    url = uris.get("art_crop")
+    return (iid, url) if iid and url else None
+
+
+def build_art(db: sqlite3.Connection, sources: dict[str, tuple[str, str]], work: Path, out: Path) -> int:
+    """Fills the art table from cached/new illustration hashes. Returns rows."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python -I` drops the script dir
+    try:
+        import art
+    except ImportError as e:
+        log(f"art: skipped ({e}); pip install pillow numpy")
+        return 0
+    cache_path = work / "art_hashes_mtg.json.gz"
+    cache = art.load_cache(cache_path)
+    wanted = {iid: url for iid, url in sources.values()}
+    added = art.update_hashes(
+        wanted, cache, user_agent=USER_AGENT, max_new=int(os.environ.get("ART_MAX_NEW", "20000")), log=log
+    )
+    art.save_cache(out / "art_hashes_mtg.json.gz", cache)
+    rows = [(cid, cache[iid]) for cid, (iid, _) in sources.items() if iid in cache]
+    db.executemany("INSERT INTO art VALUES (?,?)", rows)
+    log(f"art: +{added} new, {len(rows)}/{len(sources)} printings hashed")
+    return len(rows)
+
+
+def build_icons(db: sqlite3.Connection, sets: list[dict], work: Path, out: Path) -> int:
+    """Fills set_icons from cached/new symbol masks. Returns rows."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import icons
+        import resvg_py  # noqa: F401 - fail early when missing
+    except ImportError as e:
+        log(f"icons: skipped ({e}); pip install pillow numpy resvg-py")
+        return 0
+    cache = icons.load_cache(work / "set_icons_mtg.json.gz")
+    urls = {s["icon_svg_uri"] for s in sets if s.get("icon_svg_uri")}
+    added = icons.update_masks(urls, cache, user_agent=USER_AGENT, log=log)
+    icons.save_cache(out / "set_icons_mtg.json.gz", cache)
+    rows = [(s["code"], bytes.fromhex(cache[s["icon_svg_uri"]])) for s in sets if cache.get(s.get("icon_svg_uri"))]
+    db.executemany("INSERT INTO set_icons VALUES (?,?)", rows)
+    log(f"icons: +{added} new, {len(rows)}/{len(sets)} sets")
+    return len(rows)
+
+
 def build_catalog(work: Path, out: Path, cache: bool) -> dict:
     bulk = fetch_json(SCRYFALL_BULK)
     jsonl = fetch(bulk["jsonl_download_uri"], work / "default_cards.jsonl.gz", cache)
@@ -199,21 +256,30 @@ def build_catalog(work: Path, out: Path, cache: bool) -> dict:
 
     digest = hashlib.sha256()
     rows, skipped = [], 0
+    art_sources: dict[str, tuple[str, str]] = {}
     with gzip.open(jsonl, "rt", encoding="utf-8") as f:
         for line in f:
             line = line.strip().rstrip(",")
             if not line or line in ("[", "]"):
                 continue
-            row = card_row(json.loads(line))
+            card = json.loads(line)
+            row = card_row(card)
             if row is None:
                 skipped += 1
                 continue
             rows.append(row)
+            src = art_source(card)
+            if src:
+                art_sources[row[0]] = src
     rows.sort(key=lambda r: r[0])
     for r in rows:  # structural hash: ignores image cache-busters and text tweaks
         digest.update(f"{r[0]}|{r[2]}|{r[5]}|{r[6]}|{r[13]}\n".encode())
     db.executemany(f"INSERT INTO cards VALUES ({','.join('?' * 24)})", rows)
     db.execute("INSERT INTO cards_fts(cards_fts) VALUES ('rebuild')")
+    art_rows = build_art(db, art_sources, work, out)
+    icon_rows = build_icons(db, sets, work, out)
+    # New scanner indexes must reach phones even when no card changed.
+    digest.update(f"art|{art_rows}|icons|{icon_rows}\n".encode())
 
     version = digest.hexdigest()[:16]
     built = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -223,6 +289,8 @@ def build_catalog(work: Path, out: Path, cache: bool) -> dict:
         ("version", version),
         ("built_at", built),
         ("card_count", str(len(rows))),
+        ("art_count", str(art_rows)),
+        ("icon_count", str(icon_rows)),
         ("image_base", "https://cards.scryfall.io/{size}/"),
         ("attribution", "Card data and images: Scryfall (scryfall.com). Wizards of the Coast."),
     ])

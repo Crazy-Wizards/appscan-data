@@ -35,7 +35,10 @@ jobs:
             gh release create data --title "Data packs" \
               --notes "Stable download URL for the app: releases/download/data/manifest.json"
           fi
-          gh release upload data out/manifest.json out/catalog_mtg.sqlite.gz out/prices_mtg.jsonl.gz --clobber
+          # Packs first, manifest last: clients must never see a manifest that
+          # points at files not uploaded yet.
+          gh release upload data out/catalog_mtg.sqlite.gz out/prices_mtg.jsonl.gz --clobber
+          gh release upload data out/manifest.json --clobber
 
       - name: Keep dated price snapshot
         run: |

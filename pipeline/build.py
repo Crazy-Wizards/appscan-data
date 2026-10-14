@@ -292,7 +292,10 @@ def ingest_cardmarket(work: Path, cache: bool, cards: dict, known: dict[str, str
         if not sid:
             continue
         put(cards, known, sid, "cardmarket", "n", {"r": num(g.get("trend")), "low": num(g.get("low")), "avg": num(g.get("avg"))})
-        put(cards, known, sid, "cardmarket", "f", {"r": num(g.get("trend-foil")), "low": num(g.get("low-foil")), "avg": num(g.get("avg-foil"))})
+        # Cardmarket has one foil price; etched-only printings store it as "e".
+        fs = known.get(sid, "")
+        foil = "e" if "e" in fs and "f" not in fs else "f"
+        put(cards, known, sid, "cardmarket", foil, {"r": num(g.get("trend-foil")), "low": num(g.get("low-foil")), "avg": num(g.get("avg-foil"))})
         n += 1
     return n
 
